@@ -2,39 +2,28 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"log"
-	"net/http"
-	"net/url"
 	"os"
 	"regexp"
 	"strings"
 	"time"
 
 	"github.com/michimani/gotwi"
+	"github.com/michimani/gotwi/fields"
+	"github.com/michimani/gotwi/resources"
 	"github.com/michimani/gotwi/tweet/managetweet"
+	managetypes "github.com/michimani/gotwi/tweet/managetweet/types"
 	"github.com/michimani/gotwi/tweet/searchtweet"
+	searchtypes "github.com/michimani/gotwi/tweet/searchtweet/types"
 )
 
 type Bot struct {
-	client       *gotwi.Client
-	clientID     string
-	clientSecret string
-	accessToken  string
-	refreshToken string
+	client      *gotwi.Client
+	bearerToken string
 }
 
-type OAuth2TokenResponse struct {
-	AccessToken  string `json:"access_token"`
-	RefreshToken string `json:"refresh_token"`
-	TokenType    string `json:"token_type"`
-	ExpiresIn    int    `json:"expires_in"`
-	Scope        string `json:"scope"`
-}
+
 
 type CelebrityProfile struct {
 	Name        string
@@ -52,169 +41,74 @@ type ScamPatterns struct {
 }
 
 type AnalyzedTweet struct {
-	Tweet       *searchtweet.Tweet
-	Author      *searchtweet.User
+	Tweet       *resources.Tweet
+	Author      *resources.User
 	IsScam      bool
 	ScamScore   int
 	ScamReasons []string
 }
 
 type VulnerableUser struct {
-	User               *searchtweet.User
+	User               *resources.User
 	VulnerabilityScore int
 	VulnerableReasons  []string
 }
 
 func NewBot() (*Bot, error) {
-	// Required OAuth 2.0 credentials
-	clientID := os.Getenv("TWITTER_CLIENT_ID")
-	clientSecret := os.Getenv("TWITTER_CLIENT_SECRET")
-	accessToken := os.Getenv("TWITTER_ACCESS_TOKEN")
-	refreshToken := os.Getenv("TWITTER_REFRESH_TOKEN")
+	// Required Bearer Token for app-only authentication
+	bearerToken := os.Getenv("TWITTER_BEARER_TOKEN")
 
-	if clientID == "" || clientSecret == "" {
-		return nil, fmt.Errorf("missing required TWITTER_CLIENT_ID or TWITTER_CLIENT_SECRET")
+	if bearerToken == "" {
+		return nil, fmt.Errorf("missing required TWITTER_BEARER_TOKEN environment variable")
 	}
 
 	bot := &Bot{
-		clientID:     clientID,
-		clientSecret: clientSecret,
-		accessToken:  accessToken,
-		refreshToken: refreshToken,
+		bearerToken: bearerToken,
 	}
 
-	// Test authentication on startup
-	if err := bot.authenticateAndCreateClient(); err != nil {
-		return nil, fmt.Errorf("authentication failed on startup: %w", err)
+	// Create client and test authentication on startup
+	if err := bot.createTwitterClient(); err != nil {
+		return nil, fmt.Errorf("failed to create Twitter client: %w", err)
+	}
+
+	if err := bot.testAuthentication(); err != nil {
+		return nil, fmt.Errorf("authentication test failed: %w", err)
 	}
 
 	log.Println("✅ Authentication successful")
 	return bot, nil
 }
 
-func (b *Bot) authenticateAndCreateClient() error {
-	// If we have both access and refresh tokens, try to create client
-	if b.accessToken != "" && b.refreshToken != "" {
-		client, err := b.createTwitterClient()
-		if err == nil {
-			// Test the client with a simple API call
-			if testErr := b.testAuthentication(client); testErr == nil {
-				b.client = client
-				log.Println("✅ Using existing tokens successfully")
-				return nil
-			}
-			log.Println("⚠️ Existing tokens failed, attempting refresh...")
-		}
 
-		// Try to refresh the token
-		if refreshErr := b.refreshAccessToken(); refreshErr == nil {
-			return nil
-		}
-		log.Printf("⚠️ Token refresh failed: %v", refreshErr)
-	}
 
-	// If no tokens or refresh failed, need manual setup
-	if b.accessToken == "" {
-		return fmt.Errorf("no access token available - run with 'setup' command to get tokens")
-	}
-
-	return fmt.Errorf("authentication failed - tokens may be invalid")
-}
-
-func (b *Bot) createTwitterClient() (*gotwi.Client, error) {
+func (b *Bot) createTwitterClient() error {
 	in := &gotwi.NewClientInput{
-		AuthenticationMethod: gotwi.AuthenMethodOAuth2AuthorizationCodeFlow,
-		OAuthToken:           b.accessToken,
-		RefreshToken:         b.refreshToken,
-		ClientID:             b.clientID,
-		ClientSecret:         b.clientSecret,
+		AuthenticationMethod: gotwi.AuthenMethodOAuth2BearerToken,
+		OAuthToken:           b.bearerToken,
 	}
 
-	return gotwi.NewClient(in)
-}
-
-func (b *Bot) testAuthentication(client *gotwi.Client) error {
-	// Simple test to verify authentication works
-	ctx := context.Background()
-	p := &searchtweet.SearchRecentInput{
-		Query: "hello",
-		SearchRecentOption: searchtweet.SearchRecentOption{
-			MaxResults: gotwi.Int(10),
-		},
-	}
-	
-	_, err := searchtweet.SearchRecent(ctx, client, p)
-	return err
-}
-
-func (b *Bot) refreshAccessToken() error {
-	if b.refreshToken == "" {
-		return fmt.Errorf("no refresh token available")
-	}
-
-	log.Println("🔄 Refreshing access token...")
-
-	data := url.Values{}
-	data.Set("refresh_token", b.refreshToken)
-	data.Set("grant_type", "refresh_token")
-	data.Set("client_id", b.clientID)
-
-	req, err := http.NewRequest("POST", "https://api.twitter.com/2/oauth2/token", strings.NewReader(data.Encode()))
+	client, err := gotwi.NewClient(in)
 	if err != nil {
-		return fmt.Errorf("failed to create refresh request: %w", err)
+		return err
 	}
 
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.SetBasicAuth(b.clientID, b.clientSecret)
-
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("refresh request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return fmt.Errorf("token refresh failed with status: %d", resp.StatusCode)
-	}
-
-	var tokenResp OAuth2TokenResponse
-	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
-		return fmt.Errorf("failed to decode token response: %w", err)
-	}
-
-	// Update bot tokens
-	b.accessToken = tokenResp.AccessToken
-	if tokenResp.RefreshToken != "" {
-		b.refreshToken = tokenResp.RefreshToken
-	}
-
-	// Recreate client with new tokens
-	newClient, err := b.createTwitterClient()
-	if err != nil {
-		return fmt.Errorf("failed to create client with new tokens: %w", err)
-	}
-
-	// Test the new client
-	if err := b.testAuthentication(newClient); err != nil {
-		return fmt.Errorf("new tokens failed authentication test: %w", err)
-	}
-
-	b.client = newClient
-	log.Println("✅ Access token refreshed successfully")
+	b.client = client
 	return nil
 }
 
-func (b *Bot) handleAuthenticationError(err error) error {
-	if strings.Contains(err.Error(), "401") || strings.Contains(err.Error(), "Unauthorized") {
-		log.Println("🔄 Authentication error detected, attempting token refresh...")
-		if refreshErr := b.refreshAccessToken(); refreshErr != nil {
-			return fmt.Errorf("failed to refresh token after auth error: %w", refreshErr)
-		}
-		return nil // Successfully refreshed
+func (b *Bot) testAuthentication() error {
+	// Simple test to verify authentication works
+	ctx := context.Background()
+	p := &searchtypes.ListRecentInput{
+		Query: "hello",
+		MaxResults: 10,
 	}
-	return err // Not an auth error
+
+	_, err := searchtweet.ListRecent(ctx, b.client, p)
+	return err
 }
+
+
 
 func (b *Bot) getScamPatterns() ScamPatterns {
 	return ScamPatterns{
@@ -284,7 +178,7 @@ func (b *Bot) searchForScamTweets(ctx context.Context) ([]AnalyzedTweet, error) 
 	// Add celebrity-specific queries (limited to avoid rate limits)
 	for _, celeb := range patterns.TargetedCelebrities[:2] { // Limit to first 2 celebrities
 		for _, name := range celeb.CommonNames[:1] { // Limit to first name variant
-			query := fmt.Sprintf("(\"%s\" OR %s) (\"dm me\" OR \"message me\" OR giveaway) -is:retweet lang:en", 
+			query := fmt.Sprintf("(\"%s\" OR %s) (\"dm me\" OR \"message me\" OR giveaway) -is:retweet lang:en",
 				name, strings.ReplaceAll(name, " ", ""))
 			queries = append(queries, query)
 		}
@@ -300,7 +194,7 @@ func (b *Bot) searchForScamTweets(ctx context.Context) ([]AnalyzedTweet, error) 
 		}
 
 		allAnalyzedTweets = append(allAnalyzedTweets, tweets...)
-		
+
 		// Rate limiting - stay well within limits
 		time.Sleep(3 * time.Second)
 	}
@@ -312,40 +206,30 @@ func (b *Bot) searchForScamTweets(ctx context.Context) ([]AnalyzedTweet, error) 
 func (b *Bot) searchTweetsWithRetry(ctx context.Context, query string) ([]AnalyzedTweet, error) {
 	var analyzedTweets []AnalyzedTweet
 
-	p := &searchtweet.SearchRecentInput{
+	p := &searchtypes.ListRecentInput{
 		Query: query,
-		SearchRecentOption: searchtweet.SearchRecentOption{
-			MaxResults: gotwi.Int(50),
-			Expansions: []searchtweet.Expansion{
-				searchtweet.ExpansionAuthorID,
-			},
-			TweetFields: []searchtweet.TweetField{
-				searchtweet.TweetFieldCreatedAt,
-				searchtweet.TweetFieldAuthorID,
-				searchtweet.TweetFieldConversationID,
-				searchtweet.TweetFieldPublicMetrics,
-				searchtweet.TweetFieldContextAnnotations,
-			},
-			UserFields: []searchtweet.UserField{
-				searchtweet.UserFieldCreatedAt,
-				searchtweet.UserFieldDescription,
-				searchtweet.UserFieldPublicMetrics,
-				searchtweet.UserFieldVerified,
-				searchtweet.UserFieldProfileImageURL,
-			},
+		MaxResults: 50,
+		Expansions: fields.ExpansionList{
+			fields.ExpansionAuthorID,
+		},
+		TweetFields: fields.TweetFieldList{
+			fields.TweetFieldCreatedAt,
+			fields.TweetFieldAuthorID,
+			fields.TweetFieldConversationID,
+			fields.TweetFieldPublicMetrics,
+			fields.TweetFieldContextAnnotations,
+		},
+		UserFields: fields.UserFieldList{
+			fields.UserFieldCreatedAt,
+			fields.UserFieldDescription,
+			fields.UserFieldPublicMetrics,
+			fields.UserFieldVerified,
 		},
 	}
 
-	res, err := searchtweet.SearchRecent(ctx, b.client, p)
+	res, err := searchtweet.ListRecent(ctx, b.client, p)
 	if err != nil {
-		// Try to handle authentication errors
-		if authErr := b.handleAuthenticationError(err); authErr == nil {
-			// Retry after successful token refresh
-			res, err = searchtweet.SearchRecent(ctx, b.client, p)
-		}
-		if err != nil {
-			return nil, err
-		}
+		return nil, err
 	}
 
 	if res.Data == nil {
@@ -353,13 +237,13 @@ func (b *Bot) searchTweetsWithRetry(ctx context.Context, query string) ([]Analyz
 	}
 
 	// Process each tweet
-	for _, tweet := range *res.Data {
-		var author *searchtweet.User
+	for _, tweet := range res.Data {
+		var author *resources.User
 
 		// Find the author in includes
-		if res.Includes != nil && res.Includes.Users != nil {
-			for _, user := range *res.Includes.Users {
-				if user.ID == tweet.AuthorID {
+		if len(res.Includes.Users) > 0 {
+			for _, user := range res.Includes.Users {
+				if gotwi.StringValue(user.ID) == gotwi.StringValue(tweet.AuthorID) {
 					author = &user
 					break
 				}
@@ -376,7 +260,7 @@ func (b *Bot) searchTweetsWithRetry(ctx context.Context, query string) ([]Analyz
 	return analyzedTweets, nil
 }
 
-func (b *Bot) analyzeTweetForScam(tweet *searchtweet.Tweet, author *searchtweet.User) AnalyzedTweet {
+func (b *Bot) analyzeTweetForScam(tweet *resources.Tweet, author *resources.User) AnalyzedTweet {
 	patterns := b.getScamPatterns()
 	analyzed := AnalyzedTweet{
 		Tweet:  tweet,
@@ -419,8 +303,8 @@ func (b *Bot) analyzeTweetForScam(tweet *searchtweet.Tweet, author *searchtweet.
 
 	// Check follower patterns
 	if author.PublicMetrics != nil {
-		followers := author.PublicMetrics.FollowersCount
-		following := author.PublicMetrics.FollowingCount
+		followers := gotwi.IntValue(author.PublicMetrics.FollowersCount)
+		following := gotwi.IntValue(author.PublicMetrics.FollowingCount)
 
 		if followers < 100 && following > 1000 {
 			scamScore += 3
@@ -434,7 +318,7 @@ func (b *Bot) analyzeTweetForScam(tweet *searchtweet.Tweet, author *searchtweet.
 	}
 
 	// Check for suspicious username patterns
-	if b.hasSuspiciousUsername(author.Username, patterns) {
+	if b.hasSuspiciousUsername(gotwi.StringValue(author.Username), patterns) {
 		scamScore += 2
 		reasons = append(reasons, "suspicious username pattern")
 	}
@@ -461,7 +345,7 @@ func (b *Bot) analyzeTweetForScam(tweet *searchtweet.Tweet, author *searchtweet.
 	}
 
 	// Check tweet content for scam patterns
-	tweetText := strings.ToLower(tweet.Text)
+	tweetText := strings.ToLower(gotwi.StringValue(tweet.Text))
 	scamKeywordCount := 0
 	for _, keyword := range patterns.CelebScamKeywords {
 		if strings.Contains(tweetText, keyword) {
@@ -521,12 +405,12 @@ func (b *Bot) hasSuspiciousUsername(username string, patterns ScamPatterns) bool
 	return false
 }
 
-func (b *Bot) isLegitimateAccount(user *searchtweet.User, celebrities []CelebrityProfile) bool {
+func (b *Bot) isLegitimateAccount(user *resources.User, celebrities []CelebrityProfile) bool {
 	if user == nil {
 		return false
 	}
 
-	username := strings.ToLower(user.Username)
+	username := strings.ToLower(gotwi.StringValue(user.Username))
 	for _, celeb := range celebrities {
 		if celeb.KnownHandle != "" && strings.ToLower(celeb.KnownHandle) == username {
 			if user.Verified != nil && *user.Verified == celeb.IsVerified {
@@ -538,19 +422,16 @@ func (b *Bot) isLegitimateAccount(user *searchtweet.User, celebrities []Celebrit
 	return false
 }
 
-func (b *Bot) checkCelebrityImpersonation(user *searchtweet.User, tweet *searchtweet.Tweet, celebrities []CelebrityProfile) (int, string) {
+func (b *Bot) checkCelebrityImpersonation(user *resources.User, tweet *resources.Tweet, celebrities []CelebrityProfile) (int, string) {
 	if user == nil {
 		return 0, ""
 	}
 
-	username := strings.ToLower(user.Username)
-	var nameText, bioText string
+	username := strings.ToLower(gotwi.StringValue(user.Username))
+	var nameText string
 
 	if user.Name != nil {
-		nameText = strings.ToLower(*user.Name)
-	}
-	if user.Description != nil {
-		bioText = strings.ToLower(*user.Description)
+		nameText = strings.ToLower(gotwi.StringValue(user.Name))
 	}
 
 	score := 0
@@ -586,8 +467,8 @@ func (b *Bot) checkCelebrityImpersonation(user *searchtweet.User, tweet *searcht
 	return score, reasonText
 }
 
-func (b *Bot) hasScamContent(tweet *searchtweet.Tweet, user *searchtweet.User, patterns ScamPatterns) bool {
-	tweetText := strings.ToLower(tweet.Text)
+func (b *Bot) hasScamContent(tweet *resources.Tweet, user *resources.User, patterns ScamPatterns) bool {
+	tweetText := strings.ToLower(gotwi.StringValue(tweet.Text))
 	for _, keyword := range patterns.CelebScamKeywords {
 		if strings.Contains(tweetText, keyword) {
 			return true
@@ -595,7 +476,7 @@ func (b *Bot) hasScamContent(tweet *searchtweet.Tweet, user *searchtweet.User, p
 	}
 
 	if user.Description != nil {
-		bioText := strings.ToLower(*user.Description)
+		bioText := strings.ToLower(gotwi.StringValue(user.Description))
 		for _, keyword := range patterns.CelebScamKeywords {
 			if strings.Contains(bioText, keyword) {
 				return true
@@ -606,19 +487,18 @@ func (b *Bot) hasScamContent(tweet *searchtweet.Tweet, user *searchtweet.User, p
 	return false
 }
 
-func (b *Bot) looksLikeCelebImpersonation(author *searchtweet.User, tweet *searchtweet.Tweet) bool {
+func (b *Bot) looksLikeCelebImpersonation(author *resources.User, tweet *resources.Tweet) bool {
 	if tweet.ContextAnnotations != nil {
-		for _, annotation := range *tweet.ContextAnnotations {
-			if annotation.Domain != nil &&
-				annotation.Domain.Name != nil &&
-				*annotation.Domain.Name == "Person" {
+		for _, annotation := range tweet.ContextAnnotations {
+			if annotation.Domain.Name != nil &&
+				gotwi.StringValue(annotation.Domain.Name) == "Person" {
 				return true
 			}
 		}
 	}
 
 	if author.Name != nil && author.Verified != nil && !*author.Verified {
-		nameText := strings.ToLower(*author.Name)
+		nameText := strings.ToLower(gotwi.StringValue(author.Name))
 		celebIndicators := []string{"official", "real", "verified", "authentic"}
 
 		for _, indicator := range celebIndicators {
@@ -636,53 +516,46 @@ func (b *Bot) findVulnerableEngagement(ctx context.Context, scamTweet AnalyzedTw
 		return nil, fmt.Errorf("no conversation ID available")
 	}
 
-	query := fmt.Sprintf("conversation_id:%s", *scamTweet.Tweet.ConversationID)
+	query := fmt.Sprintf("conversation_id:%s", gotwi.StringValue(scamTweet.Tweet.ConversationID))
 
-	p := &searchtweet.SearchRecentInput{
+	p := &searchtypes.ListRecentInput{
 		Query: query,
-		SearchRecentOption: searchtweet.SearchRecentOption{
-			MaxResults: gotwi.Int(100),
-			Expansions: []searchtweet.Expansion{
-				searchtweet.ExpansionAuthorID,
-			},
-			TweetFields: []searchtweet.TweetField{
-				searchtweet.TweetFieldCreatedAt,
-				searchtweet.TweetFieldAuthorID,
-			},
-			UserFields: []searchtweet.UserField{
-				searchtweet.UserFieldCreatedAt,
-				searchtweet.UserFieldDescription,
-				searchtweet.UserFieldPublicMetrics,
-				searchtweet.UserFieldVerified,
-			},
+		MaxResults: 100,
+		Expansions: fields.ExpansionList{
+			fields.ExpansionAuthorID,
+		},
+		TweetFields: fields.TweetFieldList{
+			fields.TweetFieldCreatedAt,
+			fields.TweetFieldAuthorID,
+		},
+		UserFields: fields.UserFieldList{
+			fields.UserFieldCreatedAt,
+			fields.UserFieldDescription,
+			fields.UserFieldPublicMetrics,
+			fields.UserFieldVerified,
 		},
 	}
 
-	res, err := searchtweet.SearchRecent(ctx, b.client, p)
+	res, err := searchtweet.ListRecent(ctx, b.client, p)
 	if err != nil {
-		if authErr := b.handleAuthenticationError(err); authErr == nil {
-			res, err = searchtweet.SearchRecent(ctx, b.client, p)
-		}
-		if err != nil {
-			return nil, fmt.Errorf("error searching conversation: %w", err)
-		}
+		return nil, fmt.Errorf("error searching conversation: %w", err)
 	}
 
 	var vulnerableUsers []VulnerableUser
 
-	if res.Data == nil || res.Includes == nil || res.Includes.Users == nil {
+	if len(res.Data) == 0 || len(res.Includes.Users) == 0 {
 		return vulnerableUsers, nil
 	}
 
 	// Analyze each user in the conversation
-	for _, user := range *res.Includes.Users {
-		if scamTweet.Author != nil && user.ID == scamTweet.Author.ID {
+	for _, user := range res.Includes.Users {
+		if scamTweet.Author != nil && gotwi.StringValue(user.ID) == gotwi.StringValue(scamTweet.Author.ID) {
 			continue
 		}
 
-		var userTweets []searchtweet.Tweet
-		for _, tweet := range *res.Data {
-			if tweet.AuthorID == user.ID {
+		var userTweets []resources.Tweet
+		for _, tweet := range res.Data {
+			if gotwi.StringValue(tweet.AuthorID) == gotwi.StringValue(user.ID) {
 				userTweets = append(userTweets, tweet)
 			}
 		}
@@ -696,7 +569,7 @@ func (b *Bot) findVulnerableEngagement(ctx context.Context, scamTweet AnalyzedTw
 	return vulnerableUsers, nil
 }
 
-func (b *Bot) analyzeUserVulnerability(user *searchtweet.User, tweets []searchtweet.Tweet) VulnerableUser {
+func (b *Bot) analyzeUserVulnerability(user *resources.User, tweets []resources.Tweet) VulnerableUser {
 	patterns := b.getScamPatterns()
 	vulnerable := VulnerableUser{
 		User: user,
@@ -707,7 +580,7 @@ func (b *Bot) analyzeUserVulnerability(user *searchtweet.User, tweets []searchtw
 
 	// Check bio for vulnerability indicators
 	if user.Description != nil {
-		bioText := strings.ToLower(*user.Description)
+		bioText := strings.ToLower(gotwi.StringValue(user.Description))
 		for _, pattern := range patterns.VulnerablePatterns {
 			if strings.Contains(bioText, pattern) {
 				score += 2
@@ -718,7 +591,7 @@ func (b *Bot) analyzeUserVulnerability(user *searchtweet.User, tweets []searchtw
 
 	// Check tweets for vulnerability indicators
 	for _, tweet := range tweets {
-		tweetText := strings.ToLower(tweet.Text)
+		tweetText := strings.ToLower(gotwi.StringValue(tweet.Text))
 		for _, pattern := range patterns.VulnerablePatterns {
 			if strings.Contains(tweetText, pattern) {
 				score += 1
@@ -747,14 +620,14 @@ func (b *Bot) analyzeUserVulnerability(user *searchtweet.User, tweets []searchtw
 		accountAge := time.Since(*user.CreatedAt)
 
 		if accountAge > 5*365*24*time.Hour && user.PublicMetrics != nil {
-			if user.PublicMetrics.FollowersCount < 200 && user.PublicMetrics.TweetCount < 1000 {
+			if gotwi.IntValue(user.PublicMetrics.FollowersCount) < 200 && gotwi.IntValue(user.PublicMetrics.TweetCount) < 1000 {
 				score += 1
 				reasons = append(reasons, "older account with low activity")
 			}
 		}
 	}
 
-	if user.PublicMetrics != nil && user.PublicMetrics.FollowersCount < 100 && len(tweets) > 0 {
+	if user.PublicMetrics != nil && gotwi.IntValue(user.PublicMetrics.FollowersCount) < 100 && len(tweets) > 0 {
 		score += 1
 		reasons = append(reasons, "low followers but engaged")
 	}
@@ -776,25 +649,19 @@ func (b *Bot) sendWarningTweet(ctx context.Context, targetUsername string, origi
 	messageIndex := int(time.Now().Unix()) % len(warningMessages)
 	warningText := fmt.Sprintf("@%s %s", targetUsername, warningMessages[messageIndex])
 
-	p := &managetweet.CreateInput{
+	p := &managetypes.CreateInput{
 		Text: gotwi.String(warningText),
 	}
 
 	if originalTweetID != "" {
-		p.Reply = &managetweet.CreateInputReply{
+		p.Reply = &managetypes.CreateInputReply{
 			InReplyToTweetID: originalTweetID,
 		}
 	}
 
 	_, err := managetweet.Create(ctx, b.client, p)
 	if err != nil {
-		// Try to handle authentication errors
-		if authErr := b.handleAuthenticationError(err); authErr == nil {
-			_, err = managetweet.Create(ctx, b.client, p)
-		}
-		if err != nil {
-			return fmt.Errorf("failed to send warning tweet: %w", err)
-		}
+		return fmt.Errorf("failed to send warning tweet: %w", err)
 	}
 
 	return nil
@@ -821,7 +688,7 @@ func (b *Bot) analyzeAndWarn(ctx context.Context) error {
 		}
 
 		log.Printf("Analyzing scam tweet from @%s (score: %d): %s",
-			scamTweet.Author.Username, scamTweet.ScamScore,
+			gotwi.StringValue(scamTweet.Author.Username), scamTweet.ScamScore,
 			strings.Join(scamTweet.ScamReasons, ", "))
 
 		// Find vulnerable users engaging with this scam
@@ -834,15 +701,15 @@ func (b *Bot) analyzeAndWarn(ctx context.Context) error {
 
 		for _, vulnerable := range vulnerableUsers {
 			log.Printf("Found vulnerable user @%s (score: %d): %s",
-				vulnerable.User.Username, vulnerable.VulnerabilityScore,
+				gotwi.StringValue(vulnerable.User.Username), vulnerable.VulnerabilityScore,
 				strings.Join(vulnerable.VulnerableReasons, ", "))
 
 			// Send warning tweet
-			err := b.sendWarningTweet(ctx, vulnerable.User.Username, scamTweet.Tweet.ID)
+			err := b.sendWarningTweet(ctx, gotwi.StringValue(vulnerable.User.Username), gotwi.StringValue(scamTweet.Tweet.ID))
 			if err != nil {
-				log.Printf("Error sending warning to @%s: %v", vulnerable.User.Username, err)
+				log.Printf("Error sending warning to @%s: %v", gotwi.StringValue(vulnerable.User.Username), err)
 			} else {
-				log.Printf("✅ Warning sent to @%s", vulnerable.User.Username)
+				log.Printf("✅ Warning sent to @%s", gotwi.StringValue(vulnerable.User.Username))
 				warningsSent++
 			}
 
@@ -892,145 +759,18 @@ func (b *Bot) Run(ctx context.Context) {
 }
 
 func validateConfig() error {
-	requiredEnvVars := []string{
-		"TWITTER_CLIENT_ID",
-		"TWITTER_CLIENT_SECRET",
+	if os.Getenv("TWITTER_BEARER_TOKEN") == "" {
+		return fmt.Errorf("missing required TWITTER_BEARER_TOKEN environment variable")
 	}
-
-	for _, envVar := range requiredEnvVars {
-		if os.Getenv(envVar) == "" {
-			return fmt.Errorf("missing required environment variable: %s", envVar)
-		}
-	}
-
-	if os.Getenv("TWITTER_ACCESS_TOKEN") == "" {
-		return fmt.Errorf("missing TWITTER_ACCESS_TOKEN - run with 'setup' command to obtain tokens")
-	}
-
-	if os.Getenv("TWITTER_REFRESH_TOKEN") == "" {
-		log.Println("⚠️ TWITTER_REFRESH_TOKEN not set - automatic token refresh will not work")
-	}
-
 	return nil
 }
 
-// OAuth 2.0 setup functions
-func generatePKCE() (codeVerifier, codeChallenge string, err error) {
-	bytes := make([]byte, 96)
-	if _, err := rand.Read(bytes); err != nil {
-		return "", "", err
-	}
-	codeVerifier = base64.RawURLEncoding.EncodeToString(bytes)
 
-	hash := sha256.Sum256([]byte(codeVerifier))
-	codeChallenge = base64.RawURLEncoding.EncodeToString(hash[:])
-
-	return codeVerifier, codeChallenge, nil
-}
-
-func (b *Bot) generateAuthURL() (string, string, error) {
-	codeVerifier, codeChallenge, err := generatePKCE()
-	if err != nil {
-		return "", "", err
-	}
-
-	baseURL := "https://twitter.com/i/oauth2/authorize"
-	params := url.Values{}
-	params.Add("response_type", "code")
-	params.Add("client_id", b.clientID)
-	params.Add("redirect_uri", "http://localhost:8080/callback")
-	params.Add("scope", "tweet.read tweet.write users.read offline.access")
-	params.Add("state", fmt.Sprintf("state-%d", time.Now().Unix()))
-	params.Add("code_challenge", codeChallenge)
-	params.Add("code_challenge_method", "S256")
-
-	authURL := fmt.Sprintf("%s?%s", baseURL, params.Encode())
-	return authURL, codeVerifier, nil
-}
-
-func (b *Bot) exchangeCodeForToken(code, codeVerifier string) (*OAuth2TokenResponse, error) {
-	data := url.Values{}
-	data.Set("code", code)
-	data.Set("grant_type", "authorization_code")
-	data.Set("client_id", b.clientID)
-	data.Set("redirect_uri", "http://localhost:8080/callback")
-	data.Set("code_verifier", codeVerifier)
-
-	req, err := http.NewRequest("POST", "https://api.twitter.com/2/oauth2/token", strings.NewReader(data.Encode()))
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.SetBasicAuth(b.clientID, b.clientSecret)
-
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("token exchange failed with status: %d", resp.StatusCode)
-	}
-
-	var tokenResp OAuth2TokenResponse
-	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
-		return nil, err
-	}
-
-	return &tokenResp, nil
-}
-
-func runOAuth2Setup() {
-	log.Println("🔐 Twitter OAuth 2.0 with PKCE Setup")
-	log.Println("=====================================")
-
-	clientID := os.Getenv("TWITTER_CLIENT_ID")
-	clientSecret := os.Getenv("TWITTER_CLIENT_SECRET")
-
-	if clientID == "" || clientSecret == "" {
-		log.Fatal("❌ Please set TWITTER_CLIENT_ID and TWITTER_CLIENT_SECRET environment variables first")
-	}
-
-	bot := &Bot{
-		clientID:     clientID,
-		clientSecret: clientSecret,
-	}
-
-	authURL, codeVerifier, err := bot.generateAuthURL()
-	if err != nil {
-		log.Fatal("❌ Failed to generate auth URL:", err)
-	}
-
-	log.Println("📋 Setup Instructions:")
-	log.Println("1. Open this URL in your browser:")
-	log.Println("   " + authURL)
-	log.Println()
-	log.Println("2. Authorize the application")
-	log.Println("3. Copy the authorization code from the callback URL")
-	log.Println("4. Use the code with the exchange function to get tokens")
-	log.Println("5. Set the following environment variables:")
-	log.Println("   export TWITTER_ACCESS_TOKEN='your_access_token'")
-	log.Println("   export TWITTER_REFRESH_TOKEN='your_refresh_token'")
-	log.Println()
-	log.Printf("🔑 Code Verifier (save this): %s", codeVerifier)
-	log.Println()
-	log.Println("ℹ️  You can implement a simple callback server or manually extract")
-	log.Println("   the authorization code from the redirect URL after authorization.")
-}
 
 func main() {
 	// Setup logging
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	log.SetPrefix("[SCAM-BOT] ")
-
-	// Check for setup command
-	if len(os.Args) > 1 && os.Args[1] == "setup" {
-		runOAuth2Setup()
-		return
-	}
 
 	// Validate configuration
 	if err := validateConfig(); err != nil {
@@ -1050,3 +790,4 @@ func main() {
 	// Run the bot
 	bot.Run(ctx)
 }
+
